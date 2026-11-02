@@ -3,9 +3,9 @@
 // قابلیت‌ها: سرو فایل استاتیک، ETag، کش مرورگر، CORS، محافظت از Path Traversal
 
 import { createServer } from 'node:http';
-import { stat, readdir } from 'node:fs/promises';
+import { stat, readdir, writeFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join, normalize, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -23,6 +23,9 @@ const MIME_TYPES = {
   '.avif': 'image/avif',
   '.ico': 'image/x-icon',
 };
+
+const MAX_UPLOAD_SIZE = 45 * 1024 * 1024;
+const MAX_REQUEST_SIZE = MAX_UPLOAD_SIZE + 1024 * 1024;
 
 const CACHE_CONTROL = 'public, max-age=86400, stale-while-revalidate=604800';
 
@@ -57,6 +60,57 @@ async function handleListImages(res) {
     .filter((entry) => entry.isFile() && MIME_TYPES[extname(entry.name).toLowerCase()])
     .map((entry) => ({ name: entry.name, url: `/images/${encodeURIComponent(entry.name)}` }));
   sendJson(res, 200, { count: images.length, images });
+}
+
+function imageExtension(data) {
+  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return '.jpg';
+  if (data.length >= 8 && data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return '.png';
+  if (data.length >= 6 && ['GIF87a', 'GIF89a'].includes(data.toString('ascii', 0, 6))) return '.gif';
+  if (data.length >= 12 && data.toString('ascii', 0, 4) === 'RIFF' && data.toString('ascii', 8, 12) === 'WEBP') return '.webp';
+  if (data.length >= 16 && data.toString('ascii', 4, 8) === 'ftyp') {
+    if (['avif', 'avis'].includes(data.toString('ascii', 8, 12))) return '.avif';
+    for (let offset = 16; offset + 4 <= Math.min(data.length, 64); offset += 4) {
+      if (['avif', 'avis'].includes(data.toString('ascii', offset, offset + 4))) return '.avif';
+    }
+  }
+  return null;
+}
+
+async function handleUpload(req, res) {
+  const contentType = req.headers['content-type'] ?? '';
+  if (!contentType.toLowerCase().startsWith('multipart/form-data') && !contentType.toLowerCase().startsWith('image/')) {
+    req.resume();
+    return sendJson(res, 415, { error: 'Expected multipart/form-data or an image content type' });
+  }
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_REQUEST_SIZE) {
+      req.resume();
+      return sendJson(res, 413, { error: 'Image is too large (maximum 45 MB)' });
+    }
+    chunks.push(chunk);
+  }
+  let data = Buffer.concat(chunks);
+  if (contentType.toLowerCase().startsWith('multipart/form-data')) {
+    try {
+      const form = await new Request('http://localhost/', { method: 'POST', headers: { 'content-type': contentType }, body: data }).formData();
+      const files = form.getAll('image');
+      if (files.length !== 1 || typeof files[0] === 'string' || [...form.keys()].length !== 1) {
+        return sendJson(res, 400, { error: 'Provide one file in the image field' });
+      }
+      data = Buffer.from(await files[0].arrayBuffer());
+    } catch {
+      return sendJson(res, 400, { error: 'Invalid multipart request' });
+    }
+  }
+  if (data.length > MAX_UPLOAD_SIZE) return sendJson(res, 413, { error: 'Image is too large (maximum 45 MB)' });
+  const extension = imageExtension(data);
+  if (!extension) return sendJson(res, 415, { error: 'Only JPEG, PNG, GIF, AVIF and WebP images are supported' });
+  const name = `${randomUUID()}${extension}`;
+  await writeFile(join(ROOT, name), data, { flag: 'wx' });
+  return sendJson(res, 201, { name, url: `/images/${name}` });
 }
 
 async function handleImage(req, res, pathname) {
@@ -104,6 +158,20 @@ async function handleImage(req, res, pathname) {
 
 const server = createServer(async (req, res) => {
   const { pathname } = new URL(req.url, `http://${req.headers.host}`);
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Max-Age': '86400' });
+    return res.end();
+  }
+
+  if (req.method === 'POST' && (pathname === '/images' || pathname === '/images/')) {
+    try { return await handleUpload(req, res); }
+    catch (error) {
+      console.error('[image-server]', error);
+      if (!res.headersSent) return sendJson(res, 500, { error: 'Upload failed' });
+      return;
+    }
+  }
 
   if (!['GET', 'HEAD'].includes(req.method)) {
     return sendJson(res, 405, { error: 'فقط GET و HEAD مجاز است' });
