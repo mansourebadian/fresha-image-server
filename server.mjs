@@ -3,11 +3,12 @@
 // قابلیت‌ها: سرو فایل استاتیک، ETag، کش مرورگر، CORS، محافظت از Path Traversal
 
 import { createServer } from 'node:http';
-import { stat, readdir, writeFile } from 'node:fs/promises';
+import { stat, readdir, open, unlink, rename } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, normalize, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import Busboy from 'busboy';
 
 const PORT = Number(process.env.PORT ?? 4001);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -24,8 +25,41 @@ const MIME_TYPES = {
   '.ico': 'image/x-icon',
 };
 
-const MAX_UPLOAD_SIZE = 45 * 1024 * 1024;
-const MAX_REQUEST_SIZE = MAX_UPLOAD_SIZE + 1024 * 1024;
+function positiveInt(name, fallback) {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
+  return value;
+}
+const MAX_UPLOAD_SIZE = positiveInt('MAX_UPLOAD_BYTES', 10 * 1024 * 1024);
+const MAX_REQUEST_SIZE = MAX_UPLOAD_SIZE + 64 * 1024;
+const STORAGE_QUOTA = positiveInt('STORAGE_QUOTA_BYTES', 1024 * 1024 * 1024);
+const MAX_CONCURRENT = positiveInt('MAX_CONCURRENT_UPLOADS', 4);
+const RATE_LIMIT = positiveInt('UPLOAD_RATE_LIMIT', 120);
+const RATE_WINDOW = positiveInt('UPLOAD_RATE_WINDOW_MS', 60_000);
+const UPLOAD_TIMEOUT = positiveInt('UPLOAD_TIMEOUT_MS', 60_000);
+const rateEntries = new Map();
+let activeUploads = 0;
+let storageUsed = 0;
+let storageReserved = 0;
+
+async function initialStorageUsage() {
+  const entries = await readdir(ROOT, { withFileTypes: true });
+  const sizes = await Promise.all(entries.filter(entry => entry.isFile()).map(async entry => (await stat(join(ROOT, entry.name))).size));
+  return sizes.reduce((sum, size) => sum + size, 0);
+}
+
+function allowUpload(ip) {
+  const now = Date.now();
+  // Bound the map and discard expired entries to prevent rate limiting itself exhausting memory.
+  for (const [key, entry] of rateEntries) if (entry.reset <= now) rateEntries.delete(key);
+  let entry = rateEntries.get(ip);
+  if (!entry) {
+    if (rateEntries.size >= 10000) return false;
+    entry = { count: 0, reset: now + RATE_WINDOW };
+    rateEntries.set(ip, entry);
+  }
+  return ++entry.count <= RATE_LIMIT;
+}
 
 const CACHE_CONTROL = 'public, max-age=86400, stale-while-revalidate=604800';
 
@@ -78,39 +112,113 @@ function imageExtension(data) {
 
 async function handleUpload(req, res) {
   const contentType = req.headers['content-type'] ?? '';
-  if (!contentType.toLowerCase().startsWith('multipart/form-data') && !contentType.toLowerCase().startsWith('image/')) {
+  const multipart = /^multipart\/form-data(?:\s*;|$)/i.test(contentType);
+  if (!multipart && !/^image\//i.test(contentType)) {
+    res.setHeader('Connection', 'close');
     req.resume();
     return sendJson(res, 415, { error: 'Expected multipart/form-data or an image content type' });
   }
-  let size = 0;
-  const chunks = [];
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > MAX_REQUEST_SIZE) {
-      req.resume();
-      return sendJson(res, 413, { error: 'Image is too large (maximum 45 MB)' });
-    }
-    chunks.push(chunk);
+  if (!allowUpload(req.socket.remoteAddress ?? 'unknown')) {
+    res.setHeader('Connection', 'close'); req.resume();
+    return sendJson(res, 429, { error: 'Upload rate limit exceeded' });
   }
-  let data = Buffer.concat(chunks);
-  if (contentType.toLowerCase().startsWith('multipart/form-data')) {
-    try {
-      const form = await new Request('http://localhost/', { method: 'POST', headers: { 'content-type': contentType }, body: data }).formData();
-      const files = form.getAll('image');
-      if (files.length !== 1 || typeof files[0] === 'string' || [...form.keys()].length !== 1) {
-        return sendJson(res, 400, { error: 'Provide one file in the image field' });
+  if (activeUploads >= MAX_CONCURRENT) {
+    res.setHeader('Connection', 'close'); req.resume();
+    return sendJson(res, 429, { error: 'Too many concurrent uploads' });
+  }
+  const length = req.headers['content-length'];
+  if (length && Number(length) > (multipart ? MAX_REQUEST_SIZE : MAX_UPLOAD_SIZE)) {
+    res.setHeader('Connection', 'close'); req.resume();
+    return sendJson(res, 413, { error: 'Upload is too large' });
+  }
+  activeUploads++;
+  const tempPath = join(ROOT, `.upload-${randomUUID()}.tmp`);
+  let file, parser, fileTask, timer, result, reserved = 0, committed = false;
+  let failure;
+  const fail = (status, message) => {
+    if (failure) return;
+    failure = Object.assign(new Error(message), { status });
+    if (parser && !parser.destroyed) parser.destroy(failure);
+    req.unpipe();
+    // Stop receiving immediately; close the connection after the error response.
+    req.pause();
+  };
+  try {
+    file = await open(tempPath, 'wx');
+    timer = setTimeout(() => {
+      fail(408, 'Upload timed out');
+      if (!res.headersSent) { res.setHeader('Connection', 'close'); sendJson(res, 408, { error: 'Upload timed out' }); }
+      if (!req.destroyed) res.once('finish', () => req.destroy());
+    }, UPLOAD_TIMEOUT);
+    let received = 0, prefix = Buffer.alloc(0);
+    const save = async (stream) => {
+      for await (const chunk of stream) {
+        if (failure) throw failure;
+        if (reserved + chunk.length > MAX_UPLOAD_SIZE) throw Object.assign(new Error('Image is too large'), { status: 413 });
+        if (storageUsed + storageReserved + chunk.length > STORAGE_QUOTA) throw Object.assign(new Error('Storage quota exceeded'), { status: 507 });
+        reserved += chunk.length;
+        storageReserved += chunk.length;
+        if (prefix.length < 64) prefix = Buffer.concat([prefix, chunk.subarray(0, 64 - prefix.length)]);
+        let offset = 0;
+        while (offset < chunk.length) offset += (await file.write(chunk, offset, chunk.length - offset)).bytesWritten;
       }
-      data = Buffer.from(await files[0].arrayBuffer());
-    } catch {
-      return sendJson(res, 400, { error: 'Invalid multipart request' });
+    };
+    if (multipart) {
+      try { parser = Busboy({ headers: req.headers, limits: { files: 1, fields: 0, fileSize: MAX_UPLOAD_SIZE + 1, fieldNameSize: 100, headerPairs: 100 } }); }
+      catch { throw Object.assign(new Error('Invalid multipart request'), { status: 400 }); }
+      let fileCount = 0;
+      parser.on('error', () => {});
+      parser.on('file', (name, stream) => {
+        fileCount++;
+        if (name !== 'image') { stream.resume(); fail(400, 'Provide one file in the image field'); return; }
+        stream.on('limit', () => fail(413, 'Image is too large'));
+        fileTask = save(stream).catch(error => { fail(error.status ?? 500, error.message); throw error; });
+        fileTask.catch(() => {});
+      });
+      for (const event of ['filesLimit', 'fieldsLimit']) parser.on(event, () => fail(400, 'Provide one file in the image field'));
+      const parsed = new Promise((resolve, reject) => {
+        parser.once('close', () => failure ? reject(failure) : resolve());
+        parser.once('error', reject);
+      });
+      parsed.catch(() => {});
+      req.on('data', chunk => {
+        received += chunk.length;
+        if (received > MAX_REQUEST_SIZE) fail(413, 'Upload is too large');
+      });
+      req.once('aborted', () => fail(400, 'Upload interrupted'));
+      req.once('error', () => fail(400, 'Upload interrupted'));
+      req.pipe(parser);
+      await parsed;
+      if (fileTask) await fileTask;
+      if (failure) throw failure;
+      if (fileCount !== 1 || !fileTask) throw Object.assign(new Error('Provide one file in the image field'), { status: 400 });
+    } else {
+      await save(req);
     }
+    const extension = imageExtension(prefix);
+    if (!extension) throw Object.assign(new Error('Only JPEG, PNG, GIF, AVIF and WebP images are supported'), { status: 415 });
+    await file.close(); file = undefined;
+    const name = `${randomUUID()}${extension}`;
+    await rename(tempPath, join(ROOT, name));
+    storageUsed += reserved;
+    committed = true;
+    result = { name, url: `/images/${name}` };
+  } catch (error) {
+    const reason = failure ?? error;
+    if (!res.headersSent && !res.destroyed) {
+      res.setHeader('Connection', 'close');
+      sendJson(res, reason.status ?? 400, { error: reason.status ? reason.message : 'Invalid or interrupted upload' });
+    }
+    req.resume();
+  } finally {
+    clearTimeout(timer);
+    if (fileTask) await fileTask.catch(() => {});
+    if (file) await file.close().catch(() => {});
+    if (!committed) await unlink(tempPath).catch(() => {});
+    storageReserved -= reserved;
+    activeUploads--;
   }
-  if (data.length > MAX_UPLOAD_SIZE) return sendJson(res, 413, { error: 'Image is too large (maximum 45 MB)' });
-  const extension = imageExtension(data);
-  if (!extension) return sendJson(res, 415, { error: 'Only JPEG, PNG, GIF, AVIF and WebP images are supported' });
-  const name = `${randomUUID()}${extension}`;
-  await writeFile(join(ROOT, name), data, { flag: 'wx' });
-  return sendJson(res, 201, { name, url: `/images/${name}` });
+  if (result && !res.destroyed) sendJson(res, 201, result);
 }
 
 async function handleImage(req, res, pathname) {
@@ -194,6 +302,7 @@ const server = createServer(async (req, res) => {
   }
 });
 
+storageUsed = await initialStorageUsage();
 server.listen(PORT, HOST, () => {
   console.log(`[image-server] running on http://localhost:${PORT}`);
   console.log(`[image-server] serving images from ${ROOT}`);
