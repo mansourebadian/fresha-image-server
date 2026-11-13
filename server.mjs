@@ -3,9 +3,9 @@
 // قابلیت‌ها: سرو فایل استاتیک، ETag، کش مرورگر، CORS، محافظت از Path Traversal
 
 import { createServer } from 'node:http';
-import { stat, readdir, open, unlink, rename } from 'node:fs/promises';
+import { stat, statfs, readdir, open, unlink, rename } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { join, normalize, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Busboy from 'busboy';
@@ -32,7 +32,17 @@ function positiveInt(name, fallback) {
 }
 const MAX_UPLOAD_SIZE = positiveInt('MAX_UPLOAD_BYTES', 10 * 1024 * 1024);
 const MAX_REQUEST_SIZE = MAX_UPLOAD_SIZE + 64 * 1024;
-const STORAGE_QUOTA = positiveInt('STORAGE_QUOTA_BYTES', 1024 * 1024 * 1024);
+const STORAGE_QUOTA = process.env.STORAGE_QUOTA_BYTES ? positiveInt('STORAGE_QUOTA_BYTES') : Infinity;
+const MIN_FREE_BYTES = positiveInt('MIN_FREE_BYTES', 1024 * 1024 * 1024);
+const UPLOAD_TOKEN = process.env.IMAGE_SERVER_TOKEN;
+if (!UPLOAD_TOKEN) throw new Error('IMAGE_SERVER_TOKEN is required');
+
+function authorized(req) {
+  const header = req.headers.authorization ?? '';
+  const expected = Buffer.from(`Bearer ${UPLOAD_TOKEN}`);
+  const actual = Buffer.from(header);
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
 const MAX_CONCURRENT = positiveInt('MAX_CONCURRENT_UPLOADS', 4);
 const RATE_LIMIT = positiveInt('UPLOAD_RATE_LIMIT', 120);
 const RATE_WINDOW = positiveInt('UPLOAD_RATE_WINDOW_MS', 60_000);
@@ -158,6 +168,8 @@ async function handleUpload(req, res) {
         if (storageUsed + storageReserved + chunk.length > STORAGE_QUOTA) throw Object.assign(new Error('Storage quota exceeded'), { status: 507 });
         reserved += chunk.length;
         storageReserved += chunk.length;
+        const disk = await statfs(ROOT);
+        if (disk.bavail * disk.bsize < MIN_FREE_BYTES + storageReserved) throw Object.assign(new Error('Insufficient free disk space'), { status: 507 });
         if (prefix.length < 64) prefix = Buffer.concat([prefix, chunk.subarray(0, 64 - prefix.length)]);
         let offset = 0;
         while (offset < chunk.length) offset += (await file.write(chunk, offset, chunk.length - offset)).bytesWritten;
@@ -205,6 +217,7 @@ async function handleUpload(req, res) {
     result = { name, url: `/images/${name}` };
   } catch (error) {
     const reason = failure ?? error;
+    if (reason.code === 'ENOSPC' || reason.code === 'EDQUOT') { reason.status = 507; reason.message = 'Insufficient storage space'; }
     if (!res.headersSent && !res.destroyed) {
       res.setHeader('Connection', 'close');
       sendJson(res, reason.status ?? 400, { error: reason.status ? reason.message : 'Invalid or interrupted upload' });
@@ -273,6 +286,7 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && (pathname === '/images' || pathname === '/images/')) {
+    if (!authorized(req)) { req.resume(); return sendJson(res, 401, { error: 'Unauthorized' }); }
     try { return await handleUpload(req, res); }
     catch (error) {
       console.error('[image-server]', error);
@@ -290,6 +304,7 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 200, { status: 'ok' });
     }
     if (pathname === '/images' || pathname === '/images/') {
+      if (!authorized(req)) return sendJson(res, 401, { error: 'Unauthorized' });
       return await handleListImages(res);
     }
     if (pathname.startsWith('/images/')) {

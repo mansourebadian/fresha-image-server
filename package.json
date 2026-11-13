@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node --env-file-if-exists=.env server.mjs"
   },
   "dependencies": {
     "busboy": "^1.6.0"
